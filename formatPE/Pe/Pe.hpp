@@ -6,8 +6,58 @@
 #include <winnt.h>
 #endif
 
+
+
 namespace Pe
 {
+
+
+
+// To avoid dependence on <type_traits>
+namespace tr
+{
+    template <typename>
+    constexpr bool is_lvalue_reference_v = false;
+
+    template <typename T>
+    constexpr bool is_lvalue_reference_v<T&> = true;
+
+    template <typename T>
+    struct remove_reference
+    {
+        using type = T;
+    };
+
+    template <typename T>
+    struct remove_reference<T&>
+    {
+        using type = T;
+    };
+
+    template <typename T>
+    struct remove_reference<T&&>
+    {
+        using type = T;
+    };
+
+    template <typename T>
+    using remove_reference_t = typename remove_reference<T>::type;
+
+    template <typename T>
+    [[nodiscard]] constexpr T&& forward(remove_reference_t<T>& arg) noexcept
+    {
+        return static_cast<T&&>(arg);
+    }
+
+    template <class T>
+    [[nodiscard]] constexpr T&& forward(remove_reference_t<T>&& arg) noexcept
+    {
+        static_assert(!is_lvalue_reference_v<T>, "bad forward call");
+        return static_cast<T&&>(arg);
+    }
+} // namespace tr
+
+
 
 enum class Arch : unsigned char
 {
@@ -57,7 +107,7 @@ struct Reloc
     unsigned short offsetInPage : 12;
     unsigned short rawType : 4; // IMG_REL_BASED_***
 
-    RelocType type() const
+    RelocType type() const noexcept
     {
         switch (rawType)
         {
@@ -72,7 +122,7 @@ struct Reloc
         }
     }
 };
-static_assert(sizeof(Reloc) == sizeof(unsigned short));
+static_assert(sizeof(Reloc) == sizeof(unsigned short), "Invalid size of Reloc");
 
 struct GenericTypes
 {
@@ -93,7 +143,7 @@ struct GenericTypes
         } UnwindInfo;
     };
 
-    union Eat
+    union ExportAddressTableEntry
     {
         Rva address;
         Rva forwarderString;
@@ -109,11 +159,13 @@ struct GenericTypes
 
         Reloc relocs[1];
 
-        unsigned int count() const
+        unsigned int count() const noexcept
         {
             return hdr.relocsSizeInBytes / sizeof(Reloc);
         }
     };
+
+    using FnImageTlsCallback = PIMAGE_TLS_CALLBACK;
 };
 
 template <Arch arch>
@@ -125,7 +177,7 @@ struct Types<Arch::x32> : public GenericTypes
     using NtHeaders = IMAGE_NT_HEADERS32;
     using OptHeader = IMAGE_OPTIONAL_HEADER32;
     using ImgThunkData = IMAGE_THUNK_DATA32;
-    union Iat
+    union ImportAddressTableEntry
     {
         unsigned int raw;
         ImgThunkData thunk;
@@ -140,12 +192,12 @@ struct Types<Arch::x32> : public GenericTypes
         unsigned int reserved : 31;
         unsigned int importByOrdinal : 1;
 
-        bool valid() const
+        bool valid() const noexcept
         {
             return raw != 0;
         }
 
-        ImportType type() const
+        ImportType type() const noexcept
         {
             if (!valid())
             {
@@ -154,10 +206,12 @@ struct Types<Arch::x32> : public GenericTypes
             return importByOrdinal ? ImportType::ordinal : ImportType::name;
         }
     };
-    static_assert(sizeof(Iat) == sizeof(unsigned int));
-    using Ilt = Iat;
-    using ImportNameTable = Iat;
+    static_assert(sizeof(ImportAddressTableEntry) == sizeof(unsigned int), "Invalid size of ImportAddressTableEntry");
+    using ImportLookupTableEntry = ImportAddressTableEntry;
+    using ImportNameTableEntry = ImportAddressTableEntry;
     
+    using TlsDir = IMAGE_TLS_DIRECTORY32;
+
     static constexpr auto k_magic = 0x010Bu; // PE32
 };
 
@@ -167,7 +221,7 @@ struct Types<Arch::x64> : public GenericTypes
     using NtHeaders = IMAGE_NT_HEADERS64;
     using OptHeader = IMAGE_OPTIONAL_HEADER64;
     using ImgThunkData = IMAGE_THUNK_DATA64;
-    union Iat
+    union ImportAddressTableEntry
     {
         unsigned long long raw;
         ImgThunkData thunk;
@@ -182,12 +236,12 @@ struct Types<Arch::x64> : public GenericTypes
         unsigned long long reserved : 63;
         unsigned long long importByOrdinal : 1;
 
-        bool valid() const
+        bool valid() const noexcept
         {
             return raw != 0;
         }
 
-        ImportType type() const
+        ImportType type() const noexcept
         {
             if (!valid())
             {
@@ -196,9 +250,11 @@ struct Types<Arch::x64> : public GenericTypes
             return importByOrdinal ? ImportType::ordinal : ImportType::name;
         }
     };
-    static_assert(sizeof(Iat) == sizeof(unsigned long long));
-    using Ilt = Iat;
-    using ImportNameTable = Iat;
+    static_assert(sizeof(ImportAddressTableEntry) == sizeof(unsigned long long), "Invalid size of ImportAddressTableEntry");
+    using ImportLookupTableEntry = ImportAddressTableEntry;
+    using ImportNameTableEntry = ImportAddressTableEntry;
+
+    using TlsDir = IMAGE_TLS_DIRECTORY64;
 
     static constexpr auto k_magic = 0x020Bu; // PE32+
 };
@@ -216,20 +272,26 @@ using DirBoundImports = Dir<IMAGE_BOUND_IMPORT_DESCRIPTOR, IMAGE_DIRECTORY_ENTRY
 using DirExports = Dir<IMAGE_EXPORT_DIRECTORY, IMAGE_DIRECTORY_ENTRY_EXPORT>;
 using DirRelocs  = Dir<IMAGE_BASE_RELOCATION, IMAGE_DIRECTORY_ENTRY_BASERELOC>;
 using DirExceptions = Dir<GenericTypes::RUNTIME_FUNCTION, IMAGE_DIRECTORY_ENTRY_EXCEPTION>;
+using DirDebug = Dir<IMAGE_DEBUG_DIRECTORY, IMAGE_DIRECTORY_ENTRY_DEBUG>;
 
-class Sections;
-class Imports;
-class DelayedImports;
-class BoundImports;
-class Exports;
-class Relocs;
-class Exceptions;
+template <Arch arch>
+using DirTls = Dir<typename Types<arch>::TlsDir, IMAGE_DIRECTORY_ENTRY_TLS>;
+
+class Sections; // Arch-independent
+template <Arch> class Imports;
+template <Arch> class DelayedImports;
+template <Arch> class BoundImports;
+template <Arch> class Exports;
+template <Arch> class Relocs;
+template <Arch> class Exceptions;
+template <Arch> class Tls;
+template <Arch> class Debug;
 
 
 struct PeMagic
 {
-    static constexpr auto k_mz = 0x5A4Du; // MZ
-    static constexpr auto k_pe = 0x00004550u; // "PE\0\0"
+    static constexpr auto k_mz = 0x5A4Dui16; // MZ
+    static constexpr auto k_pe = 0x00004550ui32; // "PE\0\0"
 };
 
 template <Arch arch>
@@ -248,31 +310,31 @@ private:
     const void* const m_base;
 
 public:
-    explicit PeHeaders(const void* base) : m_base(base)
+    explicit PeHeaders(const void* const base) noexcept : m_base(base)
     {
     }
 
-    const DosHeader* dos() const
+    const DosHeader* dos() const noexcept
     {
         return static_cast<const DosHeader*>(m_base);
     }
 
-    const NtHeaders* nt() const
+    const NtHeaders* nt() const noexcept
     {
         return reinterpret_cast<const NtHeaders*>(static_cast<const unsigned char*>(m_base) + dos()->e_lfanew);
     }
 
-    const OptHeader* opt() const
+    const OptHeader* opt() const noexcept
     {
         return &nt()->OptionalHeader;
     }
 
-    const void* mod() const
+    const void* mod() const noexcept
     {
         return m_base;
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
         const auto* const dosHdr = dos();
         if (!dosHdr)
@@ -303,7 +365,7 @@ public:
 
 struct PeArch
 {
-    static Arch classify(const void* const base)
+    static Arch classify(const void* const base) noexcept
     {
         if (PeHeaders<Arch::native>(base).valid())
         {
@@ -321,94 +383,63 @@ struct PeArch
 };
 
 
-struct Aligner
+struct Align
 {
     template <typename Type>
-    static constexpr Type alignDown(Type value, Type factor)
+    static constexpr Type alignDown(const Type value, const Type factor) noexcept
     {
         return value & ~(factor - 1);
     }
 
     template <typename Type>
-    static constexpr Type alignUp(Type value, Type factor)
+    static constexpr Type alignUp(const Type value, const Type factor) noexcept
     {
         return alignDown<Type>(value - 1, factor) + factor;
     }
 };
 
 
-class Pe : protected Aligner
+template <Arch arch>
+class Pe
 {
 public:
     using ImgDataDir = typename GenericTypes::ImgDataDir;
 
 private:
     const void* const m_base;
-    const Arch m_arch;
     const ImgType m_type;
 
 public:
-    Pe(ImgType type, const void* base) : m_base(base), m_arch(PeArch::classify(base)), m_type(type)
+    Pe(const ImgType type, const void* const base) noexcept : m_base(base), m_type(type)
     {
     }
 
-    Pe(const Pe&) = default;
-    Pe(Pe&&) = default;
-
-    static Pe fromFile(const void* base)
+    static Pe fromFile(const void* const base) noexcept
     {
         return Pe(ImgType::file, base);
     }
 
-    static Pe fromModule(const void* base)
+    static Pe fromModule(const void* const base) noexcept
     {
         return Pe(ImgType::module, base);
     }
 
-    template <Arch arch>
-    PeHeaders<arch> headers() const
+    PeHeaders<arch> headers() const noexcept
     {
-        if (arch == m_arch)
-        {
-            return PeHeaders<arch>(m_base);
-        }
-        else
-        {
-            return PeHeaders<arch>(nullptr);
-        }
+        return PeHeaders<arch>(m_base);
     }
 
     template <typename Type>
-    const Type* byRva(Rva rva) const
+    const Type* byRva(const Rva rva) const noexcept
     {
         if (m_type == ImgType::module)
         {
             return reinterpret_cast<const Type*>(static_cast<const unsigned char*>(m_base) + rva);
         }
 
-        unsigned int fileAlignment = 0;
-        unsigned int sectionAlignment = 0;
-        switch (arch())
-        {
-        case Arch::native:
-        {
-            const auto* optHdr = headers<Arch::native>().opt();
-            fileAlignment = optHdr->FileAlignment;
-            sectionAlignment = optHdr->SectionAlignment;
-            break;
-        }
-        case Arch::inverse:
-        {
-            const auto* optHdr = headers<Arch::inverse>().opt();
-            fileAlignment = optHdr->FileAlignment;
-            sectionAlignment = optHdr->SectionAlignment;
-            break;
-        }
-        default:
-        {
-            return nullptr;
-        }
-        }
+        const auto* const optHdr = headers().opt();
+        const auto fileAlignment = optHdr->FileAlignment;
+        const auto sectionAlignment = optHdr->SectionAlignment;
 
         constexpr auto k_minimalSectionAlignment = 512u;
         for (const auto& sec : sections())
@@ -421,11 +452,11 @@ public:
             unsigned long long sectionOffset = 0;
             if (sectionAlignment >= k_minimalSectionAlignment)
             {
-                sectionBase = alignDown<unsigned long long>(sec.VirtualAddress, sectionAlignment);
-                const auto alignedFileSize = alignUp<unsigned long long>(sizeOnDisk, fileAlignment);
-                const auto alignedSectionSize = alignUp<unsigned long long>(sizeInMem, sectionAlignment);
+                sectionBase = Align::alignDown<unsigned long long>(sec.VirtualAddress, sectionAlignment);
+                const auto alignedFileSize = Align::alignUp<unsigned long long>(sizeOnDisk, fileAlignment);
+                const auto alignedSectionSize = Align::alignUp<unsigned long long>(sizeInMem, sectionAlignment);
                 sectionSize = (alignedFileSize > alignedSectionSize) ? alignedSectionSize : alignedFileSize;
-                sectionOffset = alignDown<unsigned long long>(sec.PointerToRawData, k_minimalSectionAlignment);
+                sectionOffset = Align::alignDown<unsigned long long>(sec.PointerToRawData, k_minimalSectionAlignment);
             }
             else
             {
@@ -444,123 +475,67 @@ public:
     }
 
     template <typename Type>
-    const Type* byOffset(unsigned int offset) const
+    const Type* byOffset(const unsigned int offset) const noexcept
     {
         return reinterpret_cast<const Type*>(reinterpret_cast<const unsigned char*>(m_base) + offset);
     }
 
-    const ImgDataDir* dir(unsigned int id) const
+    const ImgDataDir* directory(const unsigned int id) const noexcept
     {
-        switch (m_arch)
-        {
-        case Arch::native:
-        {
-            return &headers<Arch::native>().opt()->DataDirectory[id];
-        }
-        case Arch::inverse:
-        {
-            return &headers<Arch::inverse>().opt()->DataDirectory[id];
-        }
-        default:
-        {
-            return nullptr;
-        }
-        }
+        return &headers().opt()->DataDirectory[id];
     }
 
     template <typename DirType>
-    typename const DirType::Type* dir() const
+    typename const typename DirType::Type* directory() const noexcept
     {
-        const auto* const dirHdr = dir(DirType::k_id);
-        if (!dirHdr->Size)
+        const auto* const directoryHeader = directory(DirType::k_id);
+        if (!directoryHeader->Size)
         {
             return nullptr;
         }
 
-        return byRva<typename DirType::Type>(dirHdr->VirtualAddress);
+        return byRva<typename DirType::Type>(directoryHeader->VirtualAddress);
     }
 
-    unsigned long long imageBase() const
+    unsigned long long imageBase() const noexcept
     {
-        switch (m_arch)
-        {
-        case Arch::native:
-        {
-            return headers<Arch::native>().opt()->ImageBase;
-        }
-        case Arch::inverse:
-        {
-            return headers<Arch::inverse>().opt()->ImageBase;
-        }
-        default:
-        {
-            return 0;
-        }
-        }
+        return headers().opt()->ImageBase;
     }
 
-    unsigned long imageSize() const
+    unsigned long imageSize() const noexcept
     {
-        switch (m_arch)
-        {
-        case Arch::native:
-        {
-            return headers<Arch::native>().opt()->SizeOfImage;
-        }
-        case Arch::inverse:
-        {
-            return headers<Arch::inverse>().opt()->SizeOfImage;
-        }
-        default:
-        {
-            return 0;
-        }
-        }
+        return headers().opt()->SizeOfImage;
     }
 
-    unsigned long long entryPoint() const
+    unsigned long long entryPoint() const noexcept
     {
-        switch (m_arch)
-        {
-        case Arch::native:
-        {
-            return static_cast<unsigned long long>(reinterpret_cast<size_t>(byRva<void>(headers<Arch::native>().opt()->AddressOfEntryPoint)));
-        }
-        case Arch::inverse:
-        {
-            return static_cast<unsigned long long>(reinterpret_cast<size_t>(byRva<void>(headers<Arch::inverse>().opt()->AddressOfEntryPoint)));
-        }
-        default:
-        {
-            return 0;
-        }
-        }
+        return static_cast<unsigned long long>(reinterpret_cast<size_t>(byRva<void>(headers().opt()->AddressOfEntryPoint)));
     }
 
-    Arch arch() const
-    {
-        return m_arch;
-    }
-
-    ImgType type() const
+    ImgType type() const noexcept
     {
         return m_type;
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
-        return arch() != Arch::unknown;
+        return headers().valid();
     }
 
-    Sections sections() const;
-    Imports imports() const;
-    DelayedImports delayedImports() const;
-    BoundImports boundImports() const;
-    Exports exports() const;
-    Relocs relocs() const;
-    Exceptions exceptions() const;
+    Sections sections() const noexcept;
+    Imports<arch> imports() const noexcept;
+    DelayedImports<arch> delayedImports() const noexcept;
+    BoundImports<arch> boundImports() const noexcept;
+    Exports<arch> exports() const noexcept;
+    Relocs<arch> relocs() const noexcept;
+    Exceptions<arch> exceptions() const noexcept;
+    Tls<arch> tls() const noexcept;
+    Debug<arch> debug() const noexcept;
 };
 
+using Pe32 = Pe<Arch::x32>;
+using Pe64 = Pe<Arch::x64>;
+using PeNative = Pe<Arch::native>;
 
 
 
@@ -574,7 +549,7 @@ public:
         unsigned int m_pos;
 
     public:
-        Iterator(const Sections& owner, unsigned int pos)
+        Iterator(const Sections& owner, const unsigned int pos) noexcept
             : m_owner(owner)
             , m_pos(pos)
         {
@@ -584,1328 +559,1115 @@ public:
             }
         }
 
-        Iterator& operator ++ ()
+        Iterator& operator ++ () noexcept
         {
-            if (m_pos > m_owner.count())
+            if (m_pos < m_owner.count())
             {
-                return *this;
+                ++m_pos;
             }
-
-            ++m_pos;
 
             return *this;
         }
 
-        Iterator operator ++ (int)
+        Iterator operator ++ (int) noexcept
         {
             const auto it = *this;
             ++(*this);
             return it;
         }
 
-        bool operator == (const Iterator& it) const
+        bool operator == (const Iterator& it) const noexcept
         {
-            return (m_pos == it.m_pos) && (m_owner.sections() == it.m_owner.sections());
+            return m_pos == it.m_pos;
         }
 
-        bool operator != (const Iterator& it) const
+        bool operator != (const Iterator& it) const noexcept
         {
             return !operator == (it);
         }
 
-        const GenericTypes::SecHeader& operator * () const
+        const typename GenericTypes::SecHeader& operator * () const noexcept
         {
             return *operator -> ();
         }
 
-        const GenericTypes::SecHeader* operator -> () const
+        const typename GenericTypes::SecHeader* operator -> () const noexcept
         {
-            return m_owner.sections() + m_pos;
+            return &m_owner.sections()[m_pos];
         }
     };
 
 private:
-    const GenericTypes::SecHeader* const m_sections;
+    const typename GenericTypes::SecHeader* const m_sections;
     const unsigned int m_count;
 
 public:
-    Sections(const GenericTypes::SecHeader* sections, unsigned int count)
+    Sections(const typename GenericTypes::SecHeader* const sections, const unsigned int count) noexcept
         : m_sections(sections)
         , m_count(count)
     {
     }
 
-    const GenericTypes::SecHeader* sections() const
+    const typename GenericTypes::SecHeader* sections() const noexcept
     {
         return m_sections;
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
         return m_sections != nullptr;
     }
 
-    bool empty() const
+    bool empty() const noexcept
     {
         return !valid() || !m_count;
     }
 
-    unsigned int count() const
+    unsigned int count() const noexcept
     {
         return m_count;
     }
 
-    Iterator begin() const
+    Iterator begin() const noexcept
     {
         return Iterator(*this, 0);
     }
 
-    Iterator end() const
+    Iterator end() const noexcept
     {
         return Iterator(*this, m_count);
     }
 };
 
-template <typename EntryType>
-class GenericIterator
+
+
+template <typename Object>
+class Iterator
 {
+public:
+    struct TheEnd
+    {
+    };
+
 private:
-    EntryType m_entry;
+    Object m_object;
 
 public:
     template <typename... Args>
-    GenericIterator(const Args&... args) : m_entry(args...)
+    Iterator(Args&&... args) noexcept : m_object(tr::forward<Args>(args)...)
     {
     }
 
-    GenericIterator& operator ++ ()
+    explicit Iterator(const Object& obj) noexcept : m_object(obj)
     {
-        m_entry.step();
-        return *this;
     }
 
-    GenericIterator operator ++ (int)
+    bool operator == (const Iterator& it) const noexcept
     {
-        const auto it = *this;
-        ++(*this);
-        return it;
+        return m_object == it.m_object;
     }
 
-    bool operator == (const GenericIterator& it) const
+    bool operator == (TheEnd) const noexcept
     {
-        return m_entry.equals(it.m_entry);
+        return m_object == TheEnd{};
     }
 
-    bool operator != (const GenericIterator& it) const
+    bool operator != (const Iterator& it) const noexcept
     {
         return !operator == (it);
     }
 
-    const EntryType& operator * () const
+    bool operator != (TheEnd) const noexcept
     {
-        return m_entry;
+        return !operator == (TheEnd{});
     }
 
-    const EntryType* operator -> () const
+    Iterator& operator ++ () noexcept
     {
-        return &m_entry;
+        ++m_object;
+        return *this;
+    }
+
+    Iterator operator ++ (int) noexcept
+    {
+        const auto prev = *this;
+        ++(*this);
+        return prev;
+    }
+
+    const Object& operator * () const noexcept
+    {
+        return m_object;
+    }
+
+    Object& operator * () noexcept
+    {
+        return m_object;
+    }
+
+    const Object* operator -> () const noexcept
+    {
+        return &m_object;
+    }
+
+    Object* operator -> () noexcept
+    {
+        return &m_object;
     }
 };
 
+
+
+template <Arch arch>
 class Imports
 {
 public:
-    class LibEntry;
+    class ModuleEntry;
 
-    class FuncEntry
+    class FunctionEntry
     {
-    public:
-        static constexpr auto k_invalid = 0xFFFFFFFFu;
-
     private:
-        const LibEntry& m_lib;
+        const ModuleEntry& m_lib;
         unsigned int m_index;
 
     public:
-        FuncEntry(const LibEntry& lib, unsigned int index) : m_lib(lib), m_index(index)
+        FunctionEntry(const ModuleEntry& lib, const unsigned int index) noexcept : m_lib(lib), m_index(index)
         {
         }
 
-        const LibEntry& lib() const
+        const ModuleEntry& lib() const noexcept
         {
             return m_lib;
         }
 
-        unsigned int index() const
+        unsigned int index() const noexcept
         {
             return m_index;
         }
 
-        template <Arch arch>
-        const typename Types<arch>::Iat* iat() const
+        const typename Types<arch>::ImportAddressTableEntry* importAddressTableEntry() const noexcept // Import Address Table
         {
-            if ((arch != m_lib.pe().arch()) || (m_index == k_invalid))
-            {
-                return nullptr;
-            }
-
-            return &m_lib.iat<arch>()[m_index];
+            return &m_lib.importAddressTable()[m_index];
         }
 
-        template <Arch arch>
-        const typename Types<arch>::Ilt* ilt() const
+        const typename Types<arch>::ImportLookupTableEntry* importLookupTableEntry() const noexcept // Import Lookup Table
         {
-            if ((arch != m_lib.pe().arch()) || (m_index == k_invalid))
-            {
-                return nullptr;
-            }
-
-            return &m_lib.ilt<arch>()[m_index];
+            return &m_lib.importLookupTable()[m_index];
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
-            if (m_index == k_invalid)
-            {
-                return false;
-            }
-
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return ilt<Arch::native>()->valid();
-            }
-            case Arch::inverse:
-            {
-                return ilt<Arch::inverse>()->valid();
-            }
-            default:
-            {
-                return false;
-            }
-            }
+            return importLookupTableEntry()->valid();
         }
 
-        bool empty() const
+        ImportType type() const noexcept
         {
-            return !valid();
+            return importLookupTableEntry()->type();
         }
 
-        ImportType type() const
-        {
-            if (m_index == k_invalid)
-            {
-                return ImportType::unknown;
-            }
-
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return ilt<Arch::native>()->type();
-            }
-            case Arch::inverse:
-            {
-                return ilt<Arch::inverse>()->type();
-            }
-            default:
-            {
-                return ImportType::unknown;
-            }
-            }
-        }
-
-        const GenericTypes::ImgImportByName* name() const
+        const typename GenericTypes::ImgImportByName* name() const noexcept
         {
             if (type() != ImportType::name)
             {
                 return nullptr;
             }
 
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                const Rva rva = ilt<Arch::native>()->name.hintNameRva;
-                return m_lib.pe().byRva<GenericTypes::ImgImportByName>(rva);
-            }
-            case Arch::inverse:
-            {
-                const Rva rva = ilt<Arch::inverse>()->name.hintNameRva;
-                return m_lib.pe().byRva<GenericTypes::ImgImportByName>(rva);
-            }
-            default:
-            {
-                return 0;
-            }
-            }
+            const Rva rva = importLookupTableEntry()->name.hintNameRva;
+            return m_lib.pe().byRva<typename GenericTypes::ImgImportByName>(rva);
         }
 
-        unsigned long long address() const
+        unsigned long long address() const noexcept
         {
             if ((m_lib.pe().type() == ImgType::file) && !m_lib.bound())
             {
                 return 0;
             }
 
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return iat<Arch::native>()->raw;
-            }
-            case Arch::inverse:
-            {
-                return iat<Arch::inverse>()->raw;
-            }
-            default:
-            {
-                return 0;
-            }
-            }
+            return importAddressTableEntry()->raw;
         }
 
-        unsigned short ordinal() const
+        unsigned short ordinal() const noexcept
         {
             if (type() != ImportType::ordinal)
             {
                 return 0;
             }
 
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return ilt<Arch::native>()->ordinal.ord;
-            }
-            case Arch::inverse:
-            {
-                return ilt<Arch::inverse>()->ordinal.ord;
-            }
-            default:
-            {
-                return 0;
-            }
-            }
+            return importLookupTableEntry()->ordinal.ord;
         }
 
-        bool equals(const FuncEntry& entry) const
+        bool operator == (const FunctionEntry& entry) const noexcept
         {
-            if (&m_lib != &entry.m_lib)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
             return index() == entry.index();
         }
 
-        void step()
-        {
-            if (valid())
-            {
-                ++m_index;
-            }
-        }
-    };
-
-    using FuncIterator = GenericIterator<FuncEntry>;
-
-    class LibEntry
-    {
-    private:
-        const Pe& m_pe;
-        const DirImports::Type* m_desc;
-
-    public:
-        LibEntry(const Pe& pe, const DirImports::Type* desc)
-            : m_pe(pe)
-            , m_desc(desc)
-        {
-        }
-
-        const Pe& pe() const
-        {
-            return m_pe;
-        }
-
-        const DirImports::Type* desc() const
-        {
-            return m_desc;
-        }
-
-        bool valid() const
-        {
-            return m_desc && m_desc->Characteristics;
-        }
-
-        bool empty() const
+        bool operator == (typename Iterator<FunctionEntry>::TheEnd) const noexcept
         {
             return !valid();
         }
 
-        const char* libName() const
+        FunctionEntry& operator ++ () noexcept
         {
-            return m_pe.byRva<char>(m_desc->Name);
-        }
-
-        // Import Address Table:
-        template <Arch arch>
-        const typename Types<arch>::Iat* iat() const
-        {
-            if (arch == m_pe.arch())
-            {
-                return m_pe.byRva<typename Types<arch>::Iat>(m_desc->FirstThunk);
-            }
-            else
-            {
-                return nullptr;
-            }
-        }
-
-        // Import Lookup Table:
-        template <Arch arch>
-        const typename Types<arch>::Ilt* ilt() const
-        {
-            if (arch == m_pe.arch())
-            {
-                return m_pe.byRva<typename Types<arch>::Ilt>(m_desc->OriginalFirstThunk);
-            }
-            else
-            {
-                return nullptr;
-            }
-        }
-
-        bool bound() const
-        {
-            return desc()->TimeDateStamp != 0;
-        }
-
-        bool equals(const LibEntry& entry) const
-        {
-            if (&m_pe != &entry.m_pe)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
-            return desc() == entry.desc();
-        }
-
-        void step()
-        {
-            if (valid())
-            {
-                ++m_desc;
-            }
-        }
-
-        FuncIterator begin() const
-        {
-            if (!valid())
-            {
-                return end();
-            }
-
-            return FuncIterator(*this, 0);
-        }
-
-        FuncIterator end() const
-        {
-            return FuncIterator(*this, FuncEntry::k_invalid);
+            ++m_index;
+            return *this;
         }
     };
 
-    using LibIterator = GenericIterator<LibEntry>;
+    using FunctionIterator = Iterator<FunctionEntry>;
+
+    class ModuleEntry
+    {
+    private:
+        const Pe<arch>& m_pe;
+        const typename DirImports::Type* m_descriptor;
+
+    public:
+        ModuleEntry(const Pe<arch>& pe, const typename DirImports::Type* const descriptor) noexcept
+            : m_pe(pe)
+            , m_descriptor(descriptor)
+        {
+        }
+
+        const Pe<arch>& pe() const noexcept
+        {
+            return m_pe;
+        }
+
+        const typename DirImports::Type* descriptor() const noexcept
+        {
+            return m_descriptor;
+        }
+
+        bool valid() const noexcept
+        {
+            return m_descriptor && m_descriptor->Characteristics;
+        }
+
+        const char* libName() const noexcept
+        {
+            return m_pe.byRva<char>(m_descriptor->Name);
+        }
+
+        // Import Address Table:
+        const typename Types<arch>::ImportAddressTableEntry* importAddressTable() const noexcept
+        {
+            return m_pe.byRva<typename Types<arch>::ImportAddressTableEntry>(m_descriptor->FirstThunk);
+        }
+
+        // Import Lookup Table:
+        const typename Types<arch>::ImportLookupTableEntry* importLookupTable() const noexcept
+        {
+            return m_pe.byRva<typename Types<arch>::ImportLookupTableEntry>(m_descriptor->OriginalFirstThunk);
+        }
+
+        bool bound() const noexcept
+        {
+            return descriptor()->TimeDateStamp != 0;
+        }
+
+        bool operator == (const ModuleEntry& entry) const noexcept
+        {
+            return descriptor() == entry.descriptor();
+        }
+
+        bool operator == (typename Iterator<ModuleEntry>::TheEnd) const noexcept
+        {
+            return !valid();
+        }
+
+        ModuleEntry& operator ++ () noexcept
+        {
+            ++m_descriptor;
+            return *this;
+        }
+
+        FunctionIterator begin() const noexcept
+        {
+            return FunctionIterator(*this, 0);
+        }
+
+        typename FunctionIterator::TheEnd end() const noexcept
+        {
+            return {};
+        }
+    };
+
+    using ModuleIterator = Iterator<ModuleEntry>;
 
 
 private:
-    const Pe& m_pe;
+    const Pe<arch>& m_pe;
 
 public:
-    explicit Imports(const Pe& pe) : m_pe(pe)
+    explicit Imports(const Pe<arch>& pe) noexcept : m_pe(pe)
     {
     }
 
-    const Pe& pe() const
+    const Pe<arch>& pe() const noexcept
     {
         return m_pe;
     }
 
-    const DirImports::Type* desc() const
+    const typename DirImports::Type* descriptor() const noexcept
     {
-        return m_pe.dir<DirImports>();
+        return m_pe.directory<DirImports>();
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
-        return desc() != nullptr;
+        return descriptor() != nullptr;
     }
 
-    bool empty() const
+    bool empty() const noexcept
     {
-        const auto* const impDesc = desc();
-        return !impDesc || !impDesc->FirstThunk;
+        const auto* const importDescriptor = descriptor();
+        return !importDescriptor || !importDescriptor->FirstThunk;
     }
 
-    LibIterator begin() const
+    ModuleIterator begin() const noexcept
     {
-        return LibIterator(m_pe, desc());
+        return ModuleIterator(m_pe, descriptor());
     }
 
-    LibIterator end() const
+    typename ModuleIterator::TheEnd end() const noexcept
     {
-        return LibIterator(m_pe, nullptr);
+        return {};
     }
 };
 
 
 
+template <Arch arch>
 class DelayedImports
 {
 public:
-    class LibEntry;
+    class ModuleEntry;
 
-    class FuncEntry
+    class FunctionEntry
     {
-    public:
-        static constexpr auto k_invalid = 0xFFFFFFFFu;
-
     private:
-        const LibEntry& m_lib;
+        const ModuleEntry& m_lib;
         unsigned int m_index;
 
     public:
-        FuncEntry(const LibEntry& lib, unsigned int index) : m_lib(lib), m_index(index)
+        FunctionEntry(const ModuleEntry& lib, const unsigned int index) noexcept : m_lib(lib), m_index(index)
         {
         }
 
-        const LibEntry& lib() const
+        const ModuleEntry& lib() const noexcept
         {
             return m_lib;
         }
 
-        unsigned int index() const
+        unsigned int index() const noexcept
         {
             return m_index;
         }
 
-        template <Arch arch>
-        const typename Types<arch>::Iat* iat() const
+        const typename Types<arch>::ImportAddressTableEntry* importAddressTableEntry() const noexcept
         {
-            if ((arch != m_lib.pe().arch()) || (m_index == k_invalid))
-            {
-                return nullptr;
-            }
-
-            return &m_lib.iat<arch>()[m_index];
+            return &m_lib.importAddressTable()[m_index];
         }
 
-        template <Arch arch>
-        const typename Types<arch>::ImportNameTable* nameEntry() const
+        const typename Types<arch>::ImportNameTableEntry* importNameTableEntry() const noexcept
         {
-            if ((arch != m_lib.pe().arch()) || (m_index == k_invalid))
-            {
-                return nullptr;
-            }
-
-            return &m_lib.names<arch>()[m_index];
+            return &m_lib.importNameTable()[m_index];
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
-            if (m_index == k_invalid)
-            {
-                return false;
-            }
-
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return nameEntry<Arch::native>()->valid();
-            }
-            case Arch::inverse:
-            {
-                return nameEntry<Arch::inverse>()->valid();
-            }
-            default:
-            {
-                return false;
-            }
-            }
+            return importNameTableEntry()->valid();
         }
 
-        bool empty() const
+        ImportType type() const noexcept
         {
-            return !valid();
+            return importNameTableEntry()->type();
         }
 
-        ImportType type() const
-        {
-            if (m_index == k_invalid)
-            {
-                return ImportType::unknown;
-            }
-
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return nameEntry<Arch::native>()->type();
-            }
-            case Arch::inverse:
-            {
-                return nameEntry<Arch::inverse>()->type();
-            }
-            default:
-            {
-                return ImportType::unknown;
-            }
-            }
-        }
-
-        const GenericTypes::ImgImportByName* name() const
+        const typename GenericTypes::ImgImportByName* name() const noexcept
         {
             if (type() != ImportType::name)
             {
                 return nullptr;
             }
 
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                const Rva rva = nameEntry<Arch::native>()->name.hintNameRva;
-                return m_lib.pe().byRva<GenericTypes::ImgImportByName>(rva);
-            }
-            case Arch::inverse:
-            {
-                const Rva rva = nameEntry<Arch::inverse>()->name.hintNameRva;
-                return m_lib.pe().byRva<GenericTypes::ImgImportByName>(rva);
-            }
-            default:
-            {
-                return 0;
-            }
-            }
+            const Rva rva = importNameTableEntry()->name.hintNameRva;
+            return m_lib.pe().byRva<typename GenericTypes::ImgImportByName>(rva);
         }
 
-        unsigned long long address() const
+        unsigned long long address() const noexcept
         {
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return iat<Arch::native>()->raw;
-            }
-            case Arch::inverse:
-            {
-                return iat<Arch::inverse>()->raw;
-            }
-            default:
-            {
-                return 0;
-            }
-            }
+            return importAddressTableEntry()->raw;
         }
 
-        unsigned int ordinal() const
+        unsigned int ordinal() const noexcept
         {
             if (type() != ImportType::ordinal)
             {
                 return 0;
             }
 
-            switch (m_lib.pe().arch())
-            {
-            case Arch::native:
-            {
-                return nameEntry<Arch::native>()->ordinal.ord;
-            }
-            case Arch::inverse:
-            {
-                return nameEntry<Arch::inverse>()->ordinal.ord;
-            }
-            default:
-            {
-                return 0;
-            }
-            }
+            return importNameTableEntry()->ordinal.ord;
         }
 
-        bool equals(const FuncEntry& entry) const
+        bool operator == (const FunctionEntry& entry) const noexcept
         {
-            if (&m_lib != &entry.m_lib)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
             return index() == entry.index();
         }
 
-        void step()
-        {
-            if (valid())
-            {
-                ++m_index;
-            }
-        }
-    };
-
-    using FuncIterator = GenericIterator<FuncEntry>;
-
-    class LibEntry
-    {
-    private:
-        const Pe& m_pe;
-        const DirDelayedImports::Type* m_desc;
-
-    public:
-        LibEntry(const Pe& pe, const DirDelayedImports::Type* desc)
-            : m_pe(pe)
-            , m_desc(desc)
-        {
-        }
-
-        const Pe& pe() const
-        {
-            return m_pe;
-        }
-
-        const DirDelayedImports::Type* desc() const
-        {
-            return m_desc;
-        }
-
-        bool valid() const
-        {
-            return m_desc && m_desc->DllNameRVA;
-        }
-
-        bool empty() const
+        bool operator == (typename Iterator<FunctionEntry>::TheEnd) const noexcept
         {
             return !valid();
         }
 
-        const char* libName() const
+        FunctionEntry& operator ++ () noexcept
         {
-            return m_pe.byRva<char>(m_desc->DllNameRVA);
-        }
-
-        // Import Address Table:
-        template <Arch arch>
-        const typename Types<arch>::Iat* iat() const
-        {
-            if (arch == m_pe.arch())
-            {
-                return m_pe.byRva<typename Types<arch>::Iat>(m_desc->ImportAddressTableRVA);
-            }
-            else
-            {
-                return nullptr;
-            }
-        }
-
-        // Import Name Table:
-        template <Arch arch>
-        const typename Types<arch>::ImportNameTable* names() const
-        {
-            if (arch == m_pe.arch())
-            {
-                return m_pe.byRva<typename Types<arch>::ImportNameTable>(m_desc->ImportNameTableRVA);
-            }
-            else
-            {
-                return nullptr;
-            }
-        }
-
-        bool equals(const LibEntry& entry) const
-        {
-            if (&m_pe != &entry.m_pe)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
-            return desc() == entry.desc();
-        }
-
-        void step()
-        {
-            if (valid())
-            {
-                ++m_desc;
-            }
-        }
-
-        FuncIterator begin() const
-        {
-            if (!valid())
-            {
-                return end();
-            }
-
-            return FuncIterator(*this, 0);
-        }
-
-        FuncIterator end() const
-        {
-            return FuncIterator(*this, FuncEntry::k_invalid);
+            ++m_index;
+            return *this;
         }
     };
 
-    using LibIterator = GenericIterator<LibEntry>;
+    using FunctionIterator = Iterator<FunctionEntry>;
+
+    class ModuleEntry
+    {
+    private:
+        const Pe<arch>& m_pe;
+        const typename DirDelayedImports::Type* m_descriptor;
+
+    public:
+        ModuleEntry(const Pe<arch>& pe, const typename DirDelayedImports::Type* const descriptor) noexcept
+            : m_pe(pe)
+            , m_descriptor(descriptor)
+        {
+        }
+
+        const Pe<arch>& pe() const noexcept
+        {
+            return m_pe;
+        }
+
+        const typename DirDelayedImports::Type* descriptor() const noexcept
+        {
+            return m_descriptor;
+        }
+
+        bool valid() const noexcept
+        {
+            return m_descriptor && m_descriptor->DllNameRVA;
+        }
+
+        const char* moduleName() const noexcept
+        {
+            return m_pe.byRva<char>(m_descriptor->DllNameRVA);
+        }
+
+        // Import Address Table:
+        const typename Types<arch>::ImportAddressTableEntry* importAddressTable() const noexcept
+        {
+            return m_pe.byRva<typename Types<arch>::ImportAddressTableEntry>(m_descriptor->ImportAddressTableRVA);
+        }
+
+        // Import Name Table:
+        const typename Types<arch>::ImportNameTableEntry* importNameTable() const noexcept
+        {
+            return m_pe.byRva<typename Types<arch>::ImportNameTableEntry>(m_descriptor->ImportNameTableRVA);
+        }
+
+        bool operator == (const ModuleEntry& entry) const noexcept
+        {
+            return descriptor() == entry.descriptor();
+        }
+
+        bool operator == (typename Iterator<ModuleEntry>::TheEnd) const noexcept
+        {
+            return !valid();
+        }
+
+        ModuleEntry& operator ++ () noexcept
+        {
+            ++m_descriptor;
+            return *this;
+        }
+
+        FunctionIterator begin() const noexcept
+        {
+            return FunctionIterator(*this, 0);
+        }
+
+        typename Iterator<ModuleEntry>::TheEnd end() const noexcept
+        {
+            return {};
+        }
+    };
+
+    using ModuleIterator = Iterator<ModuleEntry>;
 
 private:
-    const Pe& m_pe;
+    const Pe<arch>& m_pe;
 
 public:
-    explicit DelayedImports(const Pe& pe) : m_pe(pe)
+    explicit DelayedImports(const Pe<arch>& pe) noexcept : m_pe(pe)
     {
     }
 
-    const Pe& pe() const
+    const Pe<arch>& pe() const noexcept
     {
         return m_pe;
     }
 
-    const DirDelayedImports::Type* desc() const
+    const typename DirDelayedImports::Type* descriptor() const noexcept
     {
-        return m_pe.dir<DirDelayedImports>();
+        return m_pe.directory<DirDelayedImports>();
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
-        return desc() != nullptr;
+        return descriptor() != nullptr;
     }
 
-    bool empty() const
+    bool empty() const noexcept
     {
-        const auto* const impDesc = desc();
-        return !impDesc || !impDesc->DllNameRVA;
+        const auto* const importDescriptor = descriptor();
+        return !importDescriptor || !importDescriptor->DllNameRVA;
     }
 
-    LibIterator begin() const
+    ModuleIterator begin() const noexcept
     {
-        return LibIterator(m_pe, desc());
+        return ModuleIterator(m_pe, descriptor());
     }
 
-    LibIterator end() const
+    typename ModuleIterator::TheEnd end() const noexcept
     {
-        return LibIterator(m_pe, nullptr);
+        return {};
     }
 };
 
 
 
+template <Arch arch>
 class BoundImports
 {
 public:
-    class LibEntry;
+    class ModuleEntry;
 
     class ForwarderEntry
     {
-    public:
-        static constexpr auto k_invalid = 0xFFFFFFFFu;
-
     private:
-        const LibEntry& m_lib;
+        const ModuleEntry& m_lib;
         unsigned int m_index;
 
     public:
-        ForwarderEntry(const LibEntry& lib, unsigned int index) : m_lib(lib), m_index(index)
+        ForwarderEntry(const ModuleEntry& lib, const unsigned int index) noexcept : m_lib(lib), m_index(index)
         {
         }
 
-        const LibEntry& lib() const
+        const ModuleEntry& lib() const noexcept
         {
             return m_lib;
         }
 
-        unsigned int index() const
+        unsigned int index() const noexcept
         {
             return m_index;
         }
 
-        const GenericTypes::BoundForwarderRef* desc() const
+        const typename GenericTypes::BoundForwarderRef* descriptor() const noexcept
         {
-            if (m_index == k_invalid)
-            {
-                return nullptr;
-            }
-
             return &m_lib.forwarders()[m_index];
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
-            if (m_index == k_invalid)
-            {
-                return false;
-            }
-
-            return desc()->OffsetModuleName != 0;
+            return descriptor()->OffsetModuleName != 0;
         }
 
-        const char* libName() const
+        const char* libName() const noexcept
         {
-            return reinterpret_cast<const char*>(m_lib.dirBase()) + desc()->OffsetModuleName;
+            return reinterpret_cast<const char*>(m_lib.directoryBase()) + descriptor()->OffsetModuleName;
         }
 
-        unsigned int timestamp() const
+        unsigned int timestamp() const noexcept
         {
-            return desc()->TimeDateStamp;
+            return descriptor()->TimeDateStamp;
         }
 
-        bool equals(const ForwarderEntry& entry) const
+        bool operator == (const ForwarderEntry& entry) const noexcept
         {
-            if (&m_lib != &entry.m_lib)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
             return index() == entry.index();
         }
 
-        void step()
+        ForwarderEntry& operator ++ () noexcept
         {
-            if (valid())
-            {
-                ++m_index;
-            }
+            ++m_index;
+            return *this;
         }
     };
 
-    using ForwarderIterator = GenericIterator<ForwarderEntry>;
+    using ForwarderIterator = Iterator<ForwarderEntry>;
 
 
-    class LibEntry
+    class ModuleEntry
     {
     private:
-        const Pe& m_pe;
-        const DirBoundImports::Type* const m_dirBase;
-        const DirBoundImports::Type* m_desc;
+        const typename DirBoundImports::Type* const m_directoryBase;
+        const typename DirBoundImports::Type* m_descriptor;
 
     public:
-        LibEntry(const Pe& pe, const DirBoundImports::Type* desc)
-            : m_pe(pe)
-            , m_dirBase(desc)
-            , m_desc(desc)
+        explicit ModuleEntry(const typename DirBoundImports::Type* const descriptor) noexcept
+            : m_directoryBase(descriptor)
+            , m_descriptor(descriptor)
         {
         }
 
-        const Pe& pe() const
+        const typename DirBoundImports::Type* directoryBase() const noexcept
         {
-            return m_pe;
+            return m_directoryBase;
         }
 
-        const DirBoundImports::Type* dirBase() const
+        const typename DirBoundImports::Type* descriptor() const noexcept
         {
-            return m_dirBase;
+            return m_descriptor;
         }
 
-        const DirBoundImports::Type* desc() const
+        bool valid() const noexcept
         {
-            return m_desc;
+            return m_descriptor && m_descriptor->OffsetModuleName;
         }
 
-        bool valid() const
-        {
-            return m_desc && m_desc->OffsetModuleName;
-        }
-
-        bool empty() const
+        bool empty() const noexcept
         {
             return !valid() || !forwardersCount();
         }
 
-        const char* libName() const
+        const char* libName() const noexcept
         {
-            const auto offset = desc()->OffsetModuleName;
+            const auto offset = descriptor()->OffsetModuleName;
             if (!offset)
             {
                 return nullptr;
             }
 
-            return reinterpret_cast<const char*>(m_dirBase) + offset;
+            return reinterpret_cast<const char*>(m_directoryBase) + offset;
         }
 
-        unsigned int forwardersCount() const
+        unsigned short forwardersCount() const noexcept
         {
-            return desc()->NumberOfModuleForwarderRefs;
+            if (empty())
+            {
+                return 0;
+            }
+
+            return descriptor()->NumberOfModuleForwarderRefs;
         }
 
-        const GenericTypes::BoundForwarderRef* forwarders() const
+        const typename GenericTypes::BoundForwarderRef* forwarders() const noexcept
         {
             if (empty())
             {
                 return nullptr;
             }
 
-            return reinterpret_cast<const GenericTypes::BoundForwarderRef*>(desc() + 1);
+            return reinterpret_cast<const typename GenericTypes::BoundForwarderRef*>(descriptor() + 1);
         }
 
-        bool equals(const LibEntry& entry) const
+        bool operator == (const ModuleEntry& entry) const noexcept
         {
-            if (&m_pe != &entry.m_pe)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
-            return desc() == entry.desc();
+            return descriptor() == entry.descriptor();
         }
 
-        void step()
+        bool operator == (typename Iterator<ForwarderEntry>::TheEnd) const noexcept
         {
-            if (valid())
-            {
-                m_desc = reinterpret_cast<const DirBoundImports::Type*>(reinterpret_cast<const unsigned char*>(forwarders()) + forwardersCount() * sizeof(GenericTypes::BoundForwarderRef));
-            }
+            return !valid();
         }
 
-        ForwarderIterator begin() const
+        ForwarderEntry& operator ++ () noexcept
         {
-            if (empty())
-            {
-                return end();
-            }
+            m_descriptor = reinterpret_cast<const typename DirBoundImports::Type*>(reinterpret_cast<const unsigned char*>(forwarders()) + forwardersCount() * sizeof(typename GenericTypes::BoundForwarderRef));
+            return *this;
+        }
 
+        ForwarderIterator begin() const noexcept
+        {
             return ForwarderIterator(*this, 0);
         }
 
-        ForwarderIterator end() const
+        ForwarderIterator end() const noexcept
         {
-            return ForwarderIterator(*this, ForwarderEntry::k_invalid);
+            return ForwarderIterator(*this, forwardersCount());
         }
     };
 
-    using LibIterator = GenericIterator<LibEntry>;
+    using ModuleIterator = Iterator<ModuleEntry>;
 
 private:
-    const Pe& m_pe;
+    const Pe<arch>& m_pe;
 
 public:
-    explicit BoundImports(const Pe& pe) : m_pe(pe)
+    explicit BoundImports(const Pe<arch>& pe) noexcept : m_pe(pe)
     {
     }
 
-    const Pe& pe() const
+    const Pe<arch>& pe() const noexcept
     {
         return m_pe;
     }
 
-    const DirBoundImports::Type* desc() const
+    const typename DirBoundImports::Type* descriptor() const noexcept
     {
-        return m_pe.dir<DirBoundImports>();
+        return m_pe.directory<DirBoundImports>();
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
-        return desc() != nullptr;
+        return descriptor() && descriptor()->OffsetModuleName;
     }
 
-    bool empty() const
+    ModuleIterator begin() const noexcept
     {
-        const auto* const impDesc = desc();
-        return !impDesc || !impDesc->OffsetModuleName;
+        return ModuleIterator(descriptor());
     }
 
-    LibIterator begin() const
+    typename ModuleIterator::TheEnd end() const noexcept
     {
-        return LibIterator(m_pe, desc());
-    }
-
-    LibIterator end() const
-    {
-        return LibIterator(m_pe, nullptr);
+        return {};
     }
 };
 
 
 
+template <Arch arch>
 class Exports
 {
 public:
-    class FuncEntry
+    class FunctionEntry
     {
-    public:
-        static constexpr auto k_invalid = 0xFFFFFFFFu;
-
     private:
         const Exports& m_exports;
-        const GenericTypes::Eat* const m_eat;
-        const Rva* const m_names;
-        const Ordinal* const m_ordinals;
+        const typename GenericTypes::ExportAddressTableEntry* const m_exportAddressTable;
+        const Rva* m_name;
+        const Ordinal* m_nameOrdinal;
         unsigned int m_index;
 
     public:
-        FuncEntry(const Exports& exports, unsigned int index)
+        FunctionEntry(const Exports& exports, const unsigned int index) noexcept
             : m_exports(exports)
-            , m_eat((index != k_invalid) ? exports.pe().byRva<GenericTypes::Eat>(exports.desc()->AddressOfFunctions) : nullptr)
-            , m_names((index != k_invalid) ? exports.pe().byRva<Rva>(exports.desc()->AddressOfNames) : nullptr)
-            , m_ordinals((index != k_invalid) ? exports.pe().byRva<Ordinal>(exports.desc()->AddressOfNameOrdinals) : nullptr)
+            , m_exportAddressTable(exports.tables().exportAddressTable)
+            , m_name(exports.tables().namePointerTable)
+            , m_nameOrdinal(exports.tables().nameOrdinalTable)
             , m_index(index)
         {
         }
 
-        unsigned int index() const
+        unsigned int index() const noexcept
         {
             return m_index;
         }
 
-        const GenericTypes::Eat* eat() const
+        const typename GenericTypes::ExportAddressTableEntry* exportAddressTableEntry() const noexcept
         {
-            return &m_eat[m_index];
+            return &m_exportAddressTable[m_index];
         }
 
-        ExportType type() const
+        ExportType type() const noexcept
         {
             if (!valid())
             {
                 return ExportType::unknown;
             }
 
-            return !m_exports.contains(eat()->forwarderString)
+            return !m_exports.contains(exportAddressTableEntry()->forwarderString)
                 ? ExportType::exact
                 : ExportType::forwarder;
         }
 
-        const char* name() const
+        bool hasName() const noexcept
         {
-            return m_exports.pe().byRva<char>(m_names[m_index]);
+            return m_index == *m_nameOrdinal;
         }
 
-        unsigned int ordinal() const
+        const char* name() const noexcept
         {
-            return m_ordinals[m_index];
+            return hasName()
+                ? m_exports.pe().byRva<char>(*m_name)
+                : nullptr;
         }
 
-        const void* address() const
+        unsigned int ordinal() const noexcept
+        {
+            return m_exports.ordinalBase() + m_index;
+        }
+
+        const void* address() const noexcept
         {
             if (type() != ExportType::exact)
             {
                 return nullptr;
             }
 
-            return m_exports.pe().byRva<void>(eat()->address);
+            return m_exports.pe().byRva<void>(exportAddressTableEntry()->address);
         }
 
-        const char* forwarder() const
+        const char* forwarder() const noexcept
         {
             if (type() != ExportType::forwarder)
             {
                 return nullptr;
             }
 
-            return m_exports.pe().byRva<char>(eat()->forwarderString);
+            return m_exports.pe().byRva<char>(exportAddressTableEntry()->forwarderString);
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
             return m_index < m_exports.count();
         }
 
-        bool equals(const FuncEntry& entry) const
+        bool operator == (const FunctionEntry& entry) const noexcept
         {
-            if (&m_exports != &entry.m_exports)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
             return index() == entry.index();
         }
 
-        void step()
+        FunctionEntry& operator ++ () noexcept
         {
-            if (valid())
+            if (hasName())
             {
-                ++m_index;
+                ++m_name;
+                ++m_nameOrdinal;
             }
+            ++m_index;
+            return *this;
         }
     };
 
-    using FuncIterator = GenericIterator<FuncEntry>;
-
-private:
-    const Pe& m_pe;
-    const GenericTypes::ImgDataDir* const m_dir;
-    const DirExports::Type* const m_desc;
+    using FunctionIterator = Iterator<FunctionEntry>;
 
 public:
-    explicit Exports(const Pe& pe)
+    struct Tables
+    {
+        const typename GenericTypes::ExportAddressTableEntry* exportAddressTable;
+        const Rva* namePointerTable;
+        const Ordinal* nameOrdinalTable;
+    };
+
+    class Export
+    {
+    private:
+        union
+        {
+            const void* address;
+            const char* forwarderName;
+        } m_ptr;
+        unsigned int m_ordinal;
+        ExportType m_type;
+
+    public:
+        Export() noexcept : m_ptr{}, m_ordinal(0), m_type(ExportType::unknown)
+        {
+        }
+
+        Export(const void* const addressOrForwarderName, const unsigned int ordinal, const ExportType type) noexcept
+            : m_ptr{ addressOrForwarderName }
+            , m_ordinal(ordinal)
+            , m_type(type)
+        {
+        }
+
+        const void* address() const noexcept
+        {
+            return (m_type == ExportType::exact)
+                ? m_ptr.address
+                : nullptr;
+        }
+
+        const char* forwarder() const noexcept
+        {
+            return (m_type == ExportType::forwarder)
+                ? m_ptr.forwarderName
+                : nullptr;
+        }
+
+        unsigned int ordinal() const noexcept
+        {
+            return m_ordinal;
+        }
+
+        ExportType type() const noexcept
+        {
+            return m_type;
+        }
+    };
+
+private:
+    const Pe<arch>& m_pe;
+    const typename GenericTypes::ImgDataDir* const m_directory;
+    const typename DirExports::Type* const m_descriptor;
+    const Tables m_tables;
+
+public:
+    explicit Exports(const Pe<arch>& pe) noexcept
         : m_pe(pe)
-        , m_dir(pe.dir(DirExports::k_id))
-        , m_desc(m_dir ? pe.byRva<DirExports::Type>(m_dir->VirtualAddress) : nullptr)
+        , m_directory(pe.directory(DirExports::k_id))
+        , m_descriptor(m_directory ? pe.byRva<typename DirExports::Type>(m_directory->VirtualAddress) : nullptr)
+        , m_tables(m_descriptor
+            ? Tables
+              {
+                  pe.byRva<typename GenericTypes::ExportAddressTableEntry>(m_descriptor->AddressOfFunctions),
+                  pe.byRva<Rva>(m_descriptor->AddressOfNames),
+                  pe.byRva<Ordinal>(m_descriptor->AddressOfNameOrdinals)
+              }
+            : Tables{})
     {
     }
 
-    const Pe& pe() const
+    const Pe<arch>& pe() const noexcept
     {
         return m_pe;
     }
 
-    const Rva dirRva() const
+    const Rva directoryRva() const noexcept
     {
-        return m_dir->VirtualAddress;
+        return m_directory->VirtualAddress;
     }
 
-    const unsigned int dirSize() const
+    unsigned int directorySize() const noexcept
     {
-        return m_dir->Size;
+        return m_directory->Size;
     }
 
-    bool contains(Rva rva) const
+    const Tables& tables() const noexcept
     {
-        return (rva >= dirRva()) && (rva < (dirRva() + dirSize()));
+        return m_tables;
     }
 
-    const DirExports::Type* desc() const
+    bool contains(const Rva rva) const noexcept
     {
-        return m_desc;
+        return (rva >= directoryRva()) && (rva < (directoryRva() + directorySize()));
     }
 
-    bool valid() const
+    const typename DirExports::Type* descriptor() const noexcept
     {
-        return desc() != nullptr;
+        return m_descriptor;
     }
 
-    bool empty() const
+    bool valid() const noexcept
     {
-        return count() == 0;
+        return descriptor() != nullptr;
     }
 
-    unsigned int count() const
+    unsigned int count() const noexcept
     {
-        return valid() ? desc()->NumberOfFunctions : 0;
+        return valid()
+            ? descriptor()->NumberOfFunctions
+            : 0;
     }
 
-    const char* libName() const
+    const char* moduleName() const noexcept
     {
-        const Rva rva = desc()->Name;
+        const Rva rva = descriptor()->Name;
         return m_pe.byRva<char>(rva);
     }
 
-    unsigned int base() const
+    unsigned int ordinalBase() const noexcept
     {
-        return desc()->Base;
+        return descriptor()->Base;
     }
 
-    FuncIterator begin() const
+    FunctionIterator begin() const noexcept
+    {
+        return FunctionIterator(*this, 0);
+    }
+
+    FunctionIterator end() const noexcept
+    {
+        return FunctionIterator(*this, count());
+    }
+
+    Export find(const char* const funcName) const noexcept
+    {
+        if (!funcName)
+        {
+            return {};
+        }
+
+        if (!valid())
+        {
+            return {};
+        }
+
+        const auto strByRva = [this](const Rva rva) -> const char*
+        {
+            return m_pe.byRva<char>(rva);
+        };
+
+        // [left, right):
+        unsigned int left = 0;
+        unsigned int right = m_descriptor->NumberOfNames;
+
+        while (left < right)
+        {
+            unsigned int pos = (left + right) / 2;
+            const int cmpRes = strcmp(strByRva(m_tables.namePointerTable[pos]), funcName);
+            if (cmpRes > 0)
+            {
+                right = pos;
+            }
+            else if (cmpRes < 0)
+            {
+                left = pos + 1;
+            }
+            else
+            {
+                left = pos;
+                break;
+            }
+        }
+
+        if (left == right)
+        {
+            return {};
+        }
+
+        const Ordinal unbiasedOrdinal = m_tables.nameOrdinalTable[left];
+        const auto& exportEntry = m_tables.exportAddressTable[unbiasedOrdinal];
+        if (!contains(exportEntry.address))
+        {
+            return Export(m_pe.byRva<void>(exportEntry.address), unbiasedOrdinal + ordinalBase(), ExportType::exact);
+        }
+        else
+        {
+            return Export(m_pe.byRva<void>(exportEntry.forwarderString), unbiasedOrdinal + ordinalBase(), ExportType::forwarder);
+        }
+    }
+
+    Export find(const unsigned int ordinal) const noexcept
     {
         if (!valid())
         {
-            return end();
+            return {};
         }
 
-        return FuncIterator(*this, 0);
-    }
+        const unsigned int unbiasedOrdinal = ordinal - ordinalBase();
+        if (unbiasedOrdinal >= m_descriptor->NumberOfFunctions)
+        {
+            return {};
+        }
 
-    FuncIterator end() const
-    {
-        return FuncIterator(*this, FuncEntry::k_invalid);
+        const auto& exportEntry = m_tables.exportAddressTable[unbiasedOrdinal];
+        if (!contains(exportEntry.address))
+        {
+            return Export(m_pe.byRva<void>(exportEntry.address), unbiasedOrdinal + ordinalBase(), ExportType::exact);
+        }
+        else
+        {
+            return Export(m_pe.byRva<void>(exportEntry.forwarderString), unbiasedOrdinal + ordinalBase(), ExportType::forwarder);
+        }
     }
 };
 
 
+
+template <Arch arch>
 class Relocs
 {
 public:
@@ -1913,357 +1675,515 @@ public:
 
     class RelocEntry
     {
-    public:
-        static constexpr auto k_invalid = 0xFFFFFFFFu;
-
     private:
         const PageEntry& m_page;
         unsigned int m_index;
 
     public:
-        RelocEntry(const PageEntry& page, unsigned int index) : m_page(page), m_index(index)
+        RelocEntry(const PageEntry& page, const unsigned int index) noexcept : m_page(page), m_index(index)
         {
         }
 
-        const PageEntry& page() const
+        const PageEntry& page() const noexcept
         {
             return m_page;
         }
 
-        const Reloc* reloc() const
+        const Reloc* reloc() const noexcept
         {
-            const auto* const relocs = reinterpret_cast<const Reloc*>(m_page.desc() + 1);
+            const auto* const relocs = reinterpret_cast<const Reloc*>(m_page.descriptor() + 1);
             return &relocs[m_index];
         }
 
-        const void* addr() const
+        const void* addr() const noexcept
         {
             return static_cast<const unsigned char*>(page().page()) + reloc()->offsetInPage;
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
             return m_index < m_page.count();
         }
 
-        bool equals(const RelocEntry& entry) const
+        bool operator == (const RelocEntry& entry) const noexcept
         {
-            if (&m_page != &entry.m_page)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
             return m_index == entry.m_index;
         }
 
-        void step()
+        RelocEntry& operator ++ () noexcept
         {
-            if (valid())
-            {
-                ++m_index;
-            }
+            ++m_index;
+            return *this;
         }
     };
 
-    using RelocIterator = GenericIterator<RelocEntry>;
+    using RelocIterator = Iterator<RelocEntry>;
 
     class PageEntry
     {
     private:
         const Relocs& m_relocs;
-        const DirRelocs::Type* m_entry;
+        const typename DirRelocs::Type* m_entry;
 
     public:
-        PageEntry(const Relocs& relocs, const DirRelocs::Type* entry)
+        PageEntry(const Relocs& relocs, const typename DirRelocs::Type* entry) noexcept
             : m_relocs(relocs)
             , m_entry(entry)
         {
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
             return m_entry && m_entry->VirtualAddress && m_entry->SizeOfBlock;
         }
 
-        const DirRelocs::Type* desc() const
+        const typename DirRelocs::Type* descriptor() const noexcept
         {
             return m_entry;
         }
 
-        const void* page() const
+        const void* page() const noexcept
         {
             return m_relocs.pe().byRva<void>(m_entry->VirtualAddress);
         }
 
-        unsigned int count() const
-        {
-            return (m_entry->SizeOfBlock - sizeof(*m_entry)) / sizeof(Reloc); // Not including trailing empty element
-        }
-
-        bool equals(const PageEntry& entry) const
-        {
-            if (&m_relocs != &entry.m_relocs)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
-            return desc() == entry.desc();
-        }
-
-        void step()
-        {
-            if (valid())
-            {
-                m_entry = reinterpret_cast<const DirRelocs::Type*>(
-                    reinterpret_cast<const unsigned char*>(m_entry) + m_entry->SizeOfBlock
-                );
-            }
-        }
-
-        RelocIterator begin() const
+        unsigned int count() const noexcept
         {
             if (!valid())
             {
-                return end();
+                return 0;
             }
 
+            return (m_entry->SizeOfBlock - sizeof(*m_entry)) / sizeof(Reloc); // Without trailing empty element
+        }
+
+        bool operator == (const PageEntry& entry) const noexcept
+        {
+            return descriptor() == entry.descriptor();
+        }
+
+        bool operator == (typename Iterator<PageEntry>::TheEnd) const noexcept
+        {
+            return !valid();
+        }
+
+        PageEntry& operator ++ () noexcept
+        {
+            m_entry = reinterpret_cast<const typename DirRelocs::Type*>(reinterpret_cast<const unsigned char*>(m_entry) + m_entry->SizeOfBlock);
+            return *this;
+        }
+
+        RelocIterator begin() const noexcept
+        {
             return RelocIterator(*this, 0);
         }
 
-        RelocIterator end() const
+        RelocIterator end() const noexcept
         {
-            return RelocIterator(*this, RelocEntry::k_invalid);
+            return RelocIterator(*this, count());
         }
     };
 
-    using PageIterator = GenericIterator<PageEntry>;
+    using PageIterator = Iterator<PageEntry>;
 
 private:
-    const Pe& m_pe;
-    const DirRelocs::Type* const m_table;
+    const Pe<arch>& m_pe;
+    const typename DirRelocs::Type* const m_table;
+    const unsigned int m_dirSize;
 
 public:
-    explicit Relocs(const Pe& pe) : m_pe(pe), m_table(pe.dir<DirRelocs>())
+    explicit Relocs(const Pe<arch>& pe) noexcept : m_pe(pe), m_table(pe.directory<DirRelocs>()), m_dirSize(pe.directory(DirRelocs::k_id)->Size)
     {
     }
 
-    const Pe& pe() const
+    const Pe<arch>& pe() const noexcept
     {
         return m_pe;
     }
 
-    const DirRelocs::Type* table() const
+    const typename DirRelocs::Type* relocationTable() const noexcept
     {
         return m_table;
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
-        return m_pe.valid() && table();
+        return relocationTable() != nullptr;
     }
 
-    PageIterator begin() const
+    PageIterator begin() const noexcept
     {
-        if (!valid())
-        {
-            return end();
-        }
-
-        return PageIterator(*this, table());
+        return PageIterator(*this, relocationTable());
     }
 
-    PageIterator end() const
+    PageIterator end() const noexcept
     {
-        return PageIterator(*this, nullptr);
+        return PageIterator(*this, reinterpret_cast<const typename DirRelocs::Type*>(reinterpret_cast<const unsigned char*>(relocationTable()) + m_dirSize));
     }
 };
 
 
+
+template <Arch arch>
 class Exceptions
 {
 public:
     class RuntimeFunctionEntry
     {
-    public:
-        static constexpr auto k_invalid = 0xFFFFFFFFu;
-
     private:
-        const Exceptions& m_exceptions;
-        unsigned int m_index;
+        const typename DirExceptions::Type* m_runtimeFunction;
 
     public:
-        explicit RuntimeFunctionEntry(const Exceptions& exceptions, unsigned int index)
-            : m_exceptions(exceptions)
-            , m_index(index)
+        explicit RuntimeFunctionEntry(const typename DirExceptions::Type* runtimeFunction) noexcept
+            : m_runtimeFunction(runtimeFunction)
         {
         }
 
-        const DirExceptions::Type* runtimeFunction() const
+        const typename DirExceptions::Type* runtimeFunction() const noexcept
         {
-            if (!valid())
-            {
-                return nullptr;
-            }
-
-            return &m_exceptions.runtimeFunctions()[m_index];
+            return m_runtimeFunction;
         }
 
-        bool valid() const
+        bool valid() const noexcept
         {
-            return (m_index != k_invalid) && (m_exceptions.runtimeFunctions()[m_index].BeginAddress != 0);
+            return m_runtimeFunction && m_runtimeFunction->BeginAddress;
         }
 
-        bool equals(const RuntimeFunctionEntry& entry) const
+        bool operator == (const RuntimeFunctionEntry& entry) const noexcept
         {
-            if (&m_exceptions != &entry.m_exceptions)
-            {
-                return false;
-            }
-
-            const bool thisValid = valid();
-            const bool objValid = entry.valid();
-            if (thisValid != objValid)
-            {
-                // One is valid and another is invalid:
-                return false;
-            }
-
-            if (!thisValid)
-            {
-                // Both are invalid:
-                return true;
-            }
-
             return runtimeFunction() == entry.runtimeFunction();
         }
 
-        void step()
+        bool operator == (typename Iterator<RuntimeFunctionEntry>::TheEnd) const noexcept
         {
-            if (valid())
-            {
-                ++m_index;
-            }
+            return !valid();
+        }
+
+        RuntimeFunctionEntry& operator ++ () noexcept
+        {
+            ++m_runtimeFunction;
+            return *this;
         }
     };
 
-    using RuntimeFunctionIterator = GenericIterator<RuntimeFunctionEntry>;
+    using RuntimeFunctionIterator = Iterator<RuntimeFunctionEntry>;
 
 private:
-    const Pe& m_pe;
-    const DirExceptions::Type* const m_runtimeFunctions;
+    const typename DirExceptions::Type* const m_runtimeFunctions;
 
 public:
-    explicit Exceptions(const Pe& pe)
-        : m_pe(pe)
-        , m_runtimeFunctions(pe.valid() ? pe.dir<DirExceptions>() : nullptr)
+    explicit Exceptions(const Pe<arch>& pe) noexcept : m_runtimeFunctions(pe.directory<DirExceptions>())
     {
     }
 
-    const DirExceptions::Type* runtimeFunctions() const
+    const typename DirExceptions::Type* runtimeFunctions() const noexcept
     {
         return m_runtimeFunctions;
     }
 
-    bool valid() const
+    bool valid() const noexcept
     {
         return m_runtimeFunctions != nullptr;
     }
 
-    RuntimeFunctionIterator begin() const
+    RuntimeFunctionIterator begin() const noexcept
     {
-        if (!valid())
-        {
-            return end();
-        }
-
-        return RuntimeFunctionIterator(*this, 0);
+        return RuntimeFunctionIterator(m_runtimeFunctions);
     }
 
-    RuntimeFunctionIterator end() const
+    typename RuntimeFunctionIterator::TheEnd end() const noexcept
     {
-        return RuntimeFunctionIterator(*this, RuntimeFunctionEntry::k_invalid);
+        return {};
     }
 };
 
 
-inline Sections Pe::sections() const
+
+template <Arch arch>
+class Tls
 {
-    if (m_arch == Arch::native)
+public:
+    class CallbackEntry
     {
-        const auto* const ntHdr = headers<Arch::native>().nt();
-        const auto* const firstSection = IMAGE_FIRST_SECTION(ntHdr);
-        const auto count = ntHdr->FileHeader.NumberOfSections;
-        return Sections(firstSection, count);
-    }
-    else if (m_arch == Arch::inverse)
+    private:
+        const typename GenericTypes::FnImageTlsCallback* m_callbackPointer;
+
+    public:
+        explicit CallbackEntry(const typename GenericTypes::FnImageTlsCallback* const callbacks) : m_callbackPointer(callbacks)
+        {
+        }
+
+        typename GenericTypes::FnImageTlsCallback callback() const noexcept
+        {
+            return *m_callbackPointer;
+        }
+
+        bool operator == (const CallbackEntry& entry) const noexcept
+        {
+            return m_callbackPointer == entry.m_callbackPointer;
+        }
+
+        bool operator == (typename Iterator<CallbackEntry>::TheEnd) const noexcept
+        {
+            return !m_callbackPointer || !*m_callbackPointer;
+        }
+
+        CallbackEntry& operator ++ () noexcept
+        {
+            ++m_callbackPointer;
+            return *this;
+        }
+    };
+
+    using CallbackIterator = Iterator<CallbackEntry>;
+
+private:
+    const typename DirTls<arch>::Type* const m_directory;
+
+public:
+    explicit Tls(const Pe<arch>& pe) noexcept : m_directory(pe.directory<DirTls<arch>>())
     {
-        const auto* const ntHdr = headers<Arch::inverse>().nt();
-        const auto* const firstSection = IMAGE_FIRST_SECTION(ntHdr);
-        const auto count = ntHdr->FileHeader.NumberOfSections;
-        return Sections(firstSection, count);
     }
-    else
+
+    bool valid() const noexcept
     {
-        return Sections(nullptr, 0);
+        return m_directory != nullptr;
     }
+
+    const typename GenericTypes::FnImageTlsCallback* callbacks() const noexcept
+    {
+        return valid()
+            ? reinterpret_cast<typename GenericTypes::FnImageTlsCallback*>(m_directory->AddressOfCallBacks)
+            : nullptr;
+    }
+
+    CallbackIterator begin() const noexcept
+    {
+        return CallbackIterator(callbacks());
+    }
+
+    typename CallbackIterator::TheEnd end() const noexcept
+    {
+        return {};
+    }
+};
+
+
+
+// https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/Object/CVDebugRecord.h
+namespace CodeView
+{
+
+//
+// PDB signature:
+// 
+//     PDB 2.0: "%s\\%08X%X\\%s",
+//              pdbPath,
+//              signature,
+//              age,
+//              pdbPath
+// 
+//     PDB 7.0: "%s\\%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X%X\\%s",
+//              pdbPath, 
+//              guid.Data1, guid.Data2, guid.Data3,
+//              guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7], guid.Data4[8],
+//              age,
+//              pdbPath
+//
+
+enum class CodeViewMagic : unsigned int
+{
+    pdb70 = 'SDSR', // RSDS
+    pdb20 = '01BN', // NB10
+};
+
+struct DebugInfoPdb20
+{
+    CodeViewMagic magic;
+    unsigned int offset;
+    unsigned int signature;
+    unsigned int age;
+    char pdbName[1];
+};
+
+struct DebugInfoPdb70
+{
+    CodeViewMagic magic;
+    GUID guid;
+    unsigned int age;
+    char pdbName[1];
+};
+
+union DebugInfo
+{
+    CodeViewMagic magic;
+    DebugInfoPdb20 pdb20;
+    DebugInfoPdb70 pdb70;
+};
+
+} // namespace CodeView
+
+
+
+template <Arch arch>
+class Debug
+{
+public:
+    class DebugEntry
+    {
+    private:
+        const typename DirDebug::Type* m_debugEntry;
+
+    public:
+        explicit DebugEntry(const typename DirDebug::Type* const debugEntry) noexcept : m_debugEntry(debugEntry)
+        {
+        }
+
+        const typename DirDebug::Type* debugEntry() const noexcept
+        {
+            return m_debugEntry;
+        }
+
+        bool operator == (const DebugEntry& entry) const noexcept
+        {
+            return m_debugEntry == entry.m_debugEntry;
+        }
+
+        DebugEntry& operator ++ () noexcept
+        {
+            ++m_debugEntry;
+            return *this;
+        }
+    };
+
+    using DebugIterator = Iterator<DebugEntry>;
+
+private:
+    const Pe<arch>& m_pe;
+    const typename GenericTypes::ImgDataDir* const m_directory;
+    const typename DirDebug::Type* const m_debugTable;
+
+public:
+    explicit Debug(const Pe<arch>& pe) noexcept
+        : m_pe(pe)
+        , m_directory(pe.directory(DirDebug::k_id))
+        , m_debugTable(pe.directory<DirDebug>())
+    {
+    }
+
+    const typename DirDebug::Type* debugTable() const noexcept
+    {
+        return m_debugTable;
+    }
+
+    bool valid() const noexcept
+    {
+        return m_debugTable != nullptr;
+    }
+
+    unsigned int count() const noexcept
+    {
+        if (!valid())
+        {
+            return 0;
+        }
+
+        return m_directory->Size / sizeof(typename DirDebug::Type);
+    }
+
+    DebugIterator begin() const noexcept
+    {
+        return DebugEntry(debugTable());
+    }
+
+    DebugIterator end() const noexcept
+    {
+        return DebugEntry(debugTable() + count());
+    }
+
+    const CodeView::DebugInfo* findPdbDebugInfo() const noexcept
+    {
+        for (const auto& entry : *this)
+        {
+            if (entry.debugEntry()->Type != IMAGE_DEBUG_TYPE_CODEVIEW)
+            {
+                continue;
+            }
+
+            const auto* const codeView = m_pe.byRva<CodeView::DebugInfo>(entry.debugEntry()->PointerToRawData);
+            switch (codeView->magic)
+            {
+            case CodeView::CodeViewMagic::pdb20:
+            case CodeView::CodeViewMagic::pdb70:
+            {
+                return codeView;
+            }
+            }
+        }
+
+        return nullptr;
+    }
+};
+
+
+
+template <Arch arch>
+inline Sections Pe<arch>::sections() const noexcept
+{
+    const auto* const ntHdr = headers().nt();
+    const auto* const firstSection = IMAGE_FIRST_SECTION(ntHdr);
+    const auto count = ntHdr->FileHeader.NumberOfSections;
+    return Sections(firstSection, count);
 }
 
-inline Imports Pe::imports() const
+template <Arch arch>
+inline Imports<arch> Pe<arch>::imports() const noexcept
 {
-    return Imports(*this);
+    return Imports<arch>(*this);
 }
 
-inline DelayedImports Pe::delayedImports() const
+template <Arch arch>
+inline DelayedImports<arch> Pe<arch>::delayedImports() const noexcept
 {
-    return DelayedImports(*this);
+    return DelayedImports<arch>(*this);
 }
 
-inline BoundImports Pe::boundImports() const
+template <Arch arch>
+inline BoundImports<arch> Pe<arch>::boundImports() const noexcept
 {
-    return BoundImports(*this);
+    return BoundImports<arch>(*this);
 }
 
-inline Exports Pe::exports() const
+template <Arch arch>
+inline Exports<arch> Pe<arch>::exports() const noexcept
 {
-    return Exports(*this);
+    return Exports<arch>(*this);
 }
 
-inline Relocs Pe::relocs() const
+template <Arch arch>
+inline Relocs<arch> Pe<arch>::relocs() const noexcept
 {
-    return Relocs(*this);
+    return Relocs<arch>(*this);
 }
 
-inline Exceptions Pe::exceptions() const
+template <Arch arch>
+inline Exceptions<arch> Pe<arch>::exceptions() const noexcept
 {
-    return Exceptions(*this);
+    return Exceptions<arch>(*this);
 }
+
+template <Arch arch>
+inline Tls<arch> Pe<arch>::tls() const noexcept
+{
+    return Tls<arch>(*this);
+}
+
+template <Arch arch>
+inline Debug<arch> Pe<arch>::debug() const noexcept
+{
+    return Debug<arch>(*this);
+}
+
+
 
 } // namespace Pe
