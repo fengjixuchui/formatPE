@@ -194,3 +194,30 @@ int main()
     return 0;
 }
 ```
+---
+### 🏗️ Build with CMake:
+
+```cmake
+# Link formatPE as dependency:
+add_subdirectory("./formatPE/")  # As subfolder
+target_link_libraries("TargetName" PRIVATE 
+    formatPE::Pe
+    formatPE::Pdb
+    formatPE::SymLoader
+)
+```
+
+
+Or:
+```cmake
+# Use an absolute path:
+set(formatPE_DIR "/path/to/the/formatPE/directory/with/the/CMakeLists.txt/")
+
+find_package(formatPE REQUIRED) 
+
+target_link_libraries("TargetName" PRIVATE 
+    formatPE::Pe
+    formatPE::Pdb
+    formatPE::SymLoader
+)
+```
